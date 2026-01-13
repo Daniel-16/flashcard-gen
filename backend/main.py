@@ -1,10 +1,11 @@
 import os
 import numpy as np
 import spacy
-import fitz  # PyMuPDF
+import fitz
 from typing import List, Tuple
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from sentence_transformers import SentenceTransformer
@@ -33,6 +34,14 @@ async def lifespan(app: FastAPI):
     resources.nlp = None
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class Flashcard(BaseModel):
     question: str
