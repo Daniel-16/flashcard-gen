@@ -25,13 +25,33 @@ resources = AIResources()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Loading AI Models...")
-    resources.nlp = spacy.load(SPACY_MODEL)
+    try:
+        try:
+            resources.nlp = spacy.load(SPACY_MODEL)
+            print(f"✓ spaCy model loaded: {SPACY_MODEL}")
+        except OSError:
+            import en_core_web_sm
+            resources.nlp = en_core_web_sm.load()
+            print(f"✓ spaCy model loaded from package")
+    except Exception as e:
+        print(f"✗ Failed to load spaCy: {e}")
+        raise
+    
     resources.tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
+    print(f"✓ Tokenizer loaded")
+    
     resources.model = AutoModelForSeq2SeqLM.from_pretrained(GEN_MODEL_NAME)
+    print(f"✓ Generation model loaded")
+    
     resources.embedder = SentenceTransformer(EMBED_MODEL_NAME)
-    print("Models loaded.")
+    print(f"✓ Embedder loaded")
+    
+    print("All models loaded successfully!")
     yield
     resources.nlp = None
+    resources.tokenizer = None
+    resources.model = None
+    resources.embedder = None
 
 app = FastAPI(lifespan=lifespan)
 
