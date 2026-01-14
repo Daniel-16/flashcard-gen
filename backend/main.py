@@ -11,28 +11,6 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from sentence_transformers import SentenceTransformer
 
 SPACY_MODEL = "en_core_web_sm"
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("Loading AI Models...")
-    try:
-        resources.nlp = spacy.load(SPACY_MODEL)
-        print(f"✓ spaCy model loaded: {SPACY_MODEL}")
-    except Exception as e:
-        print(f"✗ Failed to load spaCy: {e}")
-        raise
-    
-    resources.tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
-    print(f"✓ Tokenizer loaded")
-    
-    resources.model = AutoModelForSeq2SeqLM.from_pretrained(GEN_MODEL_NAME)
-    print(f"✓ Generation model loaded")
-    
-    resources.embedder = SentenceTransformer(EMBED_MODEL_NAME)
-    print(f"✓ Embedder loaded")
-    
-    print("All models loaded successfully!")
-    yield
-    resources.nlp = None
 GEN_MODEL_NAME = "google/flan-t5-base" 
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2" 
 
