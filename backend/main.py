@@ -1,7 +1,9 @@
+import asyncio
 import os
 import numpy as np
 import spacy
 import fitz
+import torch
 from typing import List, Tuple
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -11,20 +13,34 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from sentence_transformers import SentenceTransformer
 
 SPACY_MODEL = "en_core_web_sm"
-GEN_MODEL_NAME = "google/flan-t5-base" 
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2" 
+GEN_MODEL_NAME = "google/flan-t5-base"
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+GEN_BATCH_SIZE = 16  # tune down if OOM on GPU
+
+def _device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
 
 class AIResources:
     nlp = None
     tokenizer = None
     model = None
     embedder = None
+    device = "cpu"
+
 
 resources = AIResources()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Loading AI Models...")
+    resources.device = _device()
+    print(f"✓ Using device: {resources.device}")
     try:
         try:
             resources.nlp = spacy.load(SPACY_MODEL)
@@ -33,19 +49,30 @@ async def lifespan(app: FastAPI):
             import en_core_web_sm
             resources.nlp = en_core_web_sm.load()
             print(f"✓ spaCy model loaded from package")
+        # Faster NLP: keep only tok2vec, parser, ner (sents, ents, noun_chunks)
+        try:
+            resources.nlp.select_pipes(enable=["tok2vec", "parser", "ner"])
+        except Exception:
+            pass
     except Exception as e:
         print(f"✗ Failed to load spaCy: {e}")
         raise
-    
+
     resources.tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
-    print(f"✓ Tokenizer loaded")
-    
+    if resources.tokenizer.pad_token_id is None:
+        resources.tokenizer.pad_token_id = resources.tokenizer.eos_token_id
+    print("✓ Tokenizer loaded")
+
     resources.model = AutoModelForSeq2SeqLM.from_pretrained(GEN_MODEL_NAME)
-    print(f"✓ Generation model loaded")
-    
-    resources.embedder = SentenceTransformer(EMBED_MODEL_NAME)
-    print(f"✓ Embedder loaded")
-    
+    resources.model = resources.model.to(resources.device)
+    if resources.device == "cuda":
+        resources.model = resources.model.half()
+    resources.model.eval()
+    print(f"✓ Generation model loaded on {resources.device}")
+
+    resources.embedder = SentenceTransformer(EMBED_MODEL_NAME, device=resources.device)
+    print("✓ Embedder loaded")
+
     print("All models loaded successfully!")
     yield
     resources.nlp = None
@@ -76,10 +103,9 @@ class FlashcardResponse(BaseModel):
 
 def extract_text_from_pdf(file_path: str) -> str:
     doc = fitz.open(file_path)
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    return text
+    parts = [page.get_text() for page in doc]
+    doc.close()
+    return "\n".join(parts)
 
 def extract_candidate_sentences(text: str) -> List[Tuple[str, str]]:
     """
@@ -118,33 +144,45 @@ def extract_candidate_sentences(text: str) -> List[Tuple[str, str]]:
 
     return candidates
 
-def generate_question(context: str, answer: str) -> str:
-    input_text = f"generate question: context: {context} answer: {answer}"
-    
-    inputs = resources.tokenizer(
-        input_text, 
-        return_tensors="pt", 
-        max_length=512, 
-        truncation=True
-    )
-
-    outputs = resources.model.generate(
-        **inputs, 
-        max_length=64, 
-        num_beams=4, 
-        early_stopping=True
-    )
-    
-    question = resources.tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return question
+def _generate_questions_batch(contexts: List[str], answers: List[str]) -> List[str]:
+    """Generate questions in batches for much faster throughput."""
+    if not contexts:
+        return []
+    prompts = [
+        f"generate question: context: {c} answer: {a}"
+        for c, a in zip(contexts, answers)
+    ]
+    all_questions: List[str] = []
+    for i in range(0, len(prompts), GEN_BATCH_SIZE):
+        batch = prompts[i : i + GEN_BATCH_SIZE]
+        inputs = resources.tokenizer(
+            batch,
+            return_tensors="pt",
+            max_length=512,
+            truncation=True,
+            padding=True,
+            return_attention_mask=True,
+        )
+        inputs = {k: v.to(resources.device) for k, v in inputs.items()}
+        with torch.inference_mode():
+            outputs = resources.model.generate(
+                **inputs,
+                max_new_tokens=48,
+                num_beams=1,
+                do_sample=False,
+                pad_token_id=resources.tokenizer.pad_token_id or resources.tokenizer.eos_token_id,
+            )
+        questions = resources.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        all_questions.extend(q.strip() for q in questions)
+    return all_questions
 
 def deduplicate_flashcards(cards: List[Flashcard], threshold: float = 0.80) -> List[Flashcard]:
     if not cards:
         return []
-    
-    # We allow similar answers, but not similar QUESTIONS
     questions = [card.question for card in cards]
-    embeddings = resources.embedder.encode(questions)
+    embeddings = resources.embedder.encode(
+        questions, batch_size=64, show_progress_bar=False, convert_to_numpy=True
+    )
     
     # Calculate similarity
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -166,6 +204,25 @@ def deduplicate_flashcards(cards: List[Flashcard], threshold: float = 0.80) -> L
 
 # --- API Endpoints ---
 
+def _run_generation(raw_text: str, filename: str) -> FlashcardResponse:
+    """CPU/GPU-bound work; run in thread pool to avoid blocking the event loop."""
+    candidates = extract_candidate_sentences(raw_text)[:50]
+    if not candidates:
+        return FlashcardResponse(filename=filename, count=0, flashcards=[])
+    contexts = [c[0] for c in candidates]
+    answers = [c[1] for c in candidates]
+    print(f"Generating questions for {len(candidates)} valid sentences (batched)...")
+    questions = _generate_questions_batch(contexts, answers)
+    generated_cards = []
+    for (context, answer), question in zip(candidates, questions):
+        if "?" in question:
+            generated_cards.append(
+                Flashcard(question=question, answer=answer, explanation=context)
+            )
+    final_cards = deduplicate_flashcards(generated_cards)
+    return FlashcardResponse(filename=filename, count=len(final_cards), flashcards=final_cards)
+
+
 @app.post("/generate", response_model=FlashcardResponse)
 async def generate_flashcards(file: UploadFile = File(...)):
     temp_filename = f"temp_{file.filename}"
@@ -174,34 +231,7 @@ async def generate_flashcards(file: UploadFile = File(...)):
 
     try:
         raw_text = extract_text_from_pdf(temp_filename)
-        
-        # Analyze and get Candidates
-        # Increased limit to 50 for better variety
-        candidates = extract_candidate_sentences(raw_text)[:50]
-        
-        generated_cards = []
-        
-        print(f"Generating questions for {len(candidates)} valid sentences...")
-        
-        for context, answer in candidates:
-            question = generate_question(context, answer)
-            
-            # Quality Check: Question must contain a question word or ?
-            if "?" in question:
-                generated_cards.append(Flashcard(
-                    question=question,
-                    answer=answer,      # The short term
-                    explanation=context # The full "answer" derived from text
-                ))
-        
-        final_cards = deduplicate_flashcards(generated_cards)
-
-        return FlashcardResponse(
-            filename=file.filename,
-            count=len(final_cards),
-            flashcards=final_cards
-        )
-
+        return await asyncio.to_thread(_run_generation, raw_text, file.filename)
     except Exception as e:
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
